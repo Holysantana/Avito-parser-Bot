@@ -1,197 +1,336 @@
-import asyncio
-import logging
 import sys
-from datetime import datetime
-from typing import List, Dict, Any, Union, Optional
+import time
+import requests
+from bs4 import BeautifulSoup
+import vk_api
+from vk_api.bot_longpoll import VkBotLongPoll, VkBotEventType
+from vk_api.keyboard import VkKeyboard, VkKeyboardColor
 
-from aiogram import Bot, Dispatcher, F, types
-from aiogram.types import Message, ReplyKeyboardRemove, ReplyKeyboardMarkup, KeyboardButton
-from aiogram.filters import CommandStart, Command
-from aiogram.fsm.context import FSMContext
-from aiogram.fsm.storage.memory import MemoryStorage
+# ====================================================================
+# КОНФИГУРАЦИЯ И ПЕРЕМЕННЫЕ
+# ====================================================================
 
-try:
-    from config import BOT_TOKEN
-    from states import SearchStates
-    from parser import parse_doski
-    from keyboards import start_keyboard
-except ImportError:
-    BOT_TOKEN = "ВАШ_ТОКЕН_ЗДЕСЬ"
+TOKEN = "vk1.a.itJxLjYnB-XYdQJOp0xwbitA-HVsanMoi9bnvGjL4x-w1TFJ-MzrfwJuqNrDYlVFIDNDPR7XQD8PyWW5xqPewfDALesPvnd-HtxAKcEi0toCtMXvcTATgGSOrn8HXGbgB9EZ75QjqyII6TvXOZtRphbt4pD7RJr7MN5auwX7-XlGJvxnzdNhal1JP3_Dr5v1oKhXtgylWDfaEmgxC3M36w"
+GROUP_ID = 239799603
 
+CITY_MAP = {
+    "владивосток": "vladivostok",
+    "москва": "moskva",
+    "новосибирск": "novosibirsk",
+    "санкт-петербург": "spb",
+    "спб": "spb",
+    "краснодар": "krasnodar",
+    "екатеринбург": "ekaterinburg",
+    "нижний новгород": "nizhniy-novgorod",
+    "казань": "kazan",
+    "челябинск": "chelyabinsk",
+    "ростов-на-дону": "rostov-na-donu",
+    "все города": "all"
+}
 
+user_states = {}
 
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s - %(levelname)s - %(name)s - %(message)s"
-)
-logger = logging.getLogger("DoskiBotService")
+# ====================================================================
+# ВАЛИДАЦИЯ ВВОДА
+# ====================================================================
 
-bot = Bot(token=BOT_TOKEN)
-dp = Dispatcher(storage=MemoryStorage())
-
-
-
-@dp.message(CommandStart())
-async def start_handler(message: Message):
-    current_user = message.from_user.full_name
-    log_info = f"Инициализация сессии для пользователя: {current_user}"
-    print(f"[{datetime.now()}] {log_info}")
+def validate_prices(text):
+    if text == "0":
+        return True, None, None
+        
+    if "-" not in text:
+        return False, None, None
+        
+    parts = text.split("-")
+    if len(parts) != 2:
+        return False, None, None
+        
+    min_str = parts[0].strip()
+    max_str = parts[1].strip()
     
-    welcome_payload = (
-        f"Приветствуем, {current_user}!\n\n"
-        "Данный программный комплекс предназначен для мониторинга "
-        "объявлений на ресурсе doski.ru в режиме реального времени.\n"
-        "Для активации алгоритма поиска используйте кнопку управления ниже."
-    )
+    if not min_str.isdigit() or not max_str.isdigit():
+        return False, None, None
+        
+    if int(min_str) > int(max_str):
+        return False, None, None
+        
+    return True, min_str, max_str
+
+
+def validate_year(text):
+    if text == "0":
+        return True
+        
+    if text.isdigit():
+        year_num = int(text)
+        return 1900 <= year_num <= 2027
+        
+    if "-" in text:
+        parts = text.split("-")
+        if len(parts) == 2:
+            y1 = parts[0].strip()
+            y2 = parts[1].strip()
+            if y1.isdigit() and y2.isdigit():
+                return 1900 <= int(y1) <= 2027 and 1900 <= int(y2) <= 2027
+                
+    return False
+
+# ====================================================================
+# СЛУЖЕБНЫЕ ФУНКЦИИ И КЛАВИАТУРА
+# ====================================================================
+
+def init_user_session(user_id):
+    user_states[user_id] = {
+        "state": "CHOOSING_CITY",
+        "city": "all",
+        "price_min": None,
+        "price_max": None,
+        "part_name": "",
+        "car_model": "",
+        "results": [],
+        "current_index": 0
+    }
+
+
+def get_city_keyboard():
+    keyboard = VkKeyboard(one_time=True)
+    keyboard.add_button("Владивосток", color=VkKeyboardColor.PRIMARY)
+    keyboard.add_button("Москва", color=VkKeyboardColor.PRIMARY)
+    keyboard.add_line()
+    keyboard.add_button("Новосибирск", color=VkKeyboardColor.PRIMARY)
+    keyboard.add_button("Краснодар", color=VkKeyboardColor.PRIMARY)
+    keyboard.add_line()
+    keyboard.add_button("Спб", color=VkKeyboardColor.PRIMARY)
+    keyboard.add_button("Все города", color=VkKeyboardColor.SECONDARY)
+    return keyboard.get_keyboard()
+
+
+def get_pagination_keyboard():
+    keyboard = VkKeyboard(one_time=False)
+    keyboard.add_button("Показать еще 10", color=VkKeyboardColor.POSITIVE)
+    keyboard.add_line()
+    keyboard.add_button("Новый поиск", color=VkKeyboardColor.NEGATIVE)
+    return keyboard.get_keyboard()
+
+
+def send_msg(vk, peer_id, text, keyboard=None):
+    payload = {
+        "peer_id": peer_id,
+        "message": text,
+        "random_id": vk_api.utils.get_random_id()
+    }
+    if keyboard:
+        payload["keyboard"] = keyboard
+    vk.messages.send(**payload)
+
+# ====================================================================
+# БЛОК ПАРСЕРА DROM.RU
+# ====================================================================
+
+def parse_drom_parts(city_slug, query, price_min, price_max):
+    headers = {
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8",
+        "Accept-Language": "ru-RU,ru;q=0.8,en-US;q=0.5,en;q=0.3",
+        "Referer": "https://baza.drom.ru/"
+    }
     
-    await message.answer(
-        text=welcome_payload,
-        reply_markup=start_keyboard
-    )
-
-@dp.message(Command("cancel"))
-@dp.message(F.text.lower() == "отмена")
-async def cancel_handler(message: Message, state: FSMContext):
- 
-    current_active_state = await state.get_state()
-    
-    if current_active_state is None:
-        await message.answer("В данный момент нет активных процессов для отмены.")
-        return
-
-    print(f"[{datetime.now()}] Сброс состояния для ID {message.from_user.id}")
-    await state.clear()
-    await message.answer(
-        "Все активные задачи аннулированы. Система возвращена в исходное состояние.",
-        reply_markup=start_keyboard
-    )
-
-@dp.message(F.text == "Начать")
-async def begin_search(message: Message, state: FSMContext):
-
-    prompt_text = (
-        "Система готова к приему данных.\n\n"
-        "Пожалуйста, введите текстовый запрос для поиска "
-        "(например: оборудование, электроника, транспорт)."
-    )
-    
-    await message.answer(
-        text=prompt_text,
-        reply_markup=ReplyKeyboardRemove()
-    )
-    await state.set_state(SearchStates.waiting_for_query)
-
-@dp.message(SearchStates.waiting_for_query)
-async def get_query(message: Message, state: FSMContext):
-    """
-    Валидация и сохранение поискового запроса в контекст текущей сессии.
-    Выполняет проверку длины входной строки.
-    """
-    user_input = message.text.strip()
-    
-    if len(user_input) < 2:
-        await message.answer("Ошибка: Запрос слишком короткий. Введите минимум 2 символа.")
-        return
-
-    await state.update_data(query=user_input)
-    print(f"[{datetime.now()}] Запрос принят: {user_input}")
-    
-    await message.answer(
-        "Запрос зафиксирован.\n"
-
-"Укажите МИНИМАЛЬНУЮ стоимость товара в цифровом формате.\n"
-        "Если нижний порог не требуется, отправьте '0'."
-    )
-    await state.set_state(SearchStates.waiting_for_min_price)
-
-@dp.message(SearchStates.waiting_for_min_price)
-async def get_min_price(message: Message, state: FSMContext):
-    """
-    Обработка числового значения минимальной цены.
-    Включает блок проверки типа данных (Integer Validation).
-    """
-    input_data = message.text.strip()
-
-    if not input_data.isdigit():
-        await message.answer("Некорректный ввод. Система ожидает целое положительное число.")
-        return
-
-    await state.update_data(min_price=input_data)
-    await message.answer(
-        "Значение сохранено.\n"
-        "Укажите МАКСИМАЛЬНУЮ стоимость для фильтрации.\n"
-        "Или отправьте '0' для поиска без ограничений сверху."
-    )
-    await state.set_state(SearchStates.waiting_for_max_price)
-
-@dp.message(SearchStates.waiting_for_max_price)
-async def get_max_price(message: Message, state: FSMContext):
-    """
-    Финальный этап сбора данных, десериализация состояния и запуск парсера.
-    Реализует логику ветвления в зависимости от полученных результатов.
-    """
-    input_data = message.text.strip()
-
-    if not input_data.isdigit():
-        await message.answer("Ошибка формата. Пожалуйста, используйте только цифры.")
-        return
-
-    await state.update_data(max_price=input_data)
-    
-    """ Извлечение агрегированных данных из хранилища FSM """
-    storage_data = await state.get_data()
-    
-    target_query = storage_data.get("query")
-    p_min = storage_data.get("min_price")
-    p_max = storage_data.get("max_price")
-
-    await message.answer("Инициирован процесс подключения к серверу... Ожидайте.")
+    if city_slug and city_slug != "all":
+        url = f"https://baza.drom.ru/{city_slug}/sell_spare_parts/"
+    else:
+        url = "https://baza.drom.ru/sell_spare_parts/"
+        
+    params = {"query": query}
+    if price_min:
+        params["price_min"] = price_min
+    if price_max:
+        params["price_max"] = price_max
 
     try:
-        """ 
-        Вызов внешней функции парсинга. 
-        Логика преобразования строковых '0' в тип None для совместимости с API.
-        """
-        search_results = parse_doski(
-            query=target_query,
-            city="Все регионы",
-            min_price=None if p_min == "0" else p_min,
-            max_price=None if p_max == "0" else p_max
-        )
-
-        if search_results:
-            summary_report = f"Анализ завершен. Найдено совпадений: {len(search_results)}\n\n"
-            content_body = ""
-            for index, url in enumerate(search_results, 1):
-                content_body += f"{index}. {url}\n\n"
+        response = requests.get(url, params=params, headers=headers, timeout=10)
+        print(f"[Парсер] Лог запроса: {response.url}")
+        print(f"[Парсер] Код ответа сайта: {response.status_code}")
+        
+        if response.status_code != 200:
+            return []
             
-            final_message = summary_report + content_body
-        else:
-            final_message = "Поиск завершен: совпадений с заданными фильтрами не обнаружено."
+        soup = BeautifulSoup(response.text, "html.parser")
+        links = []
+        
+        for a_tag in soup.find_all("a", href=True):
+            href = a_tag["href"]
+            if ".html" in href and ("sell_spare_parts" in href or "bulletin" in href):
+                if any(x in href for x in ["/views", "/bookmark", "bulletin_id"]):
+                    continue
+                full_url = href if href.startswith("http") else f"https://baza.drom.ru{href}"
+                if full_url not in links:
+                    links.append(full_url)
+                    
+        print(f"[Парсер] Найдено ссылок: {len(links)}")
+        return links
+    except Exception as e:
+        print(f"[Ошибка парсинга]: {e}")
+        return []
 
-        await message.answer(text=final_message)
+# ====================================================================
+# БЛОК ОТДЕЛЬНЫХ ФУНКЦИЙ ОБРАБОТКИ ШАГОВ 
+# ====================================================================
 
-    except Exception as critical_error:
-        print(f"[{datetime.now()}] Ошибка исполнения: {critical_error}")
-        await message.answer("Произошел внутренний программный сбой при обработке запроса.")
+def handle_city_step(vk, user_id, text):
+    cleaned_city = text.lower()
+    if cleaned_city in CITY_MAP:
+        user_states[user_id]["city"] = CITY_MAP[cleaned_city]
+        user_states[user_id]["state"] = "AWAITING_PRICE"
+        msg = "Укажите ценовой диапазон в формате Min-Max (пример: 1000-2000).\nЕсли цена не важна, напишите: 0"
+        send_msg(vk, user_id, msg)
+    else:
+        user_states[user_id]["city"] = "all"
+        user_states[user_id]["state"] = "AWAITING_PRICE"
+        msg = f"Города '{text}' нет в списке быстрого доступа. Поиск будет производиться по всей России.\n\nУкажите диапазон цен (например: 1000-2000) или \nЕсли цена не важна, напишите: 0"
+        send_msg(vk, user_id, msg)
 
-    await state.clear()
-    await message.answer("Система готова к новому циклу поиска.", reply_markup=start_keyboard)
 
-async def run_application_loop():
-   
-    print(f"[{datetime.now()}] СИСТЕМА ЗАПУЩЕНА В РЕЖИМЕ POLLING")
+def handle_price_step(vk, user_id, text):
+    is_valid, p_min, p_max = validate_prices(text)
+    if not is_valid:
+        msg = "Неверный формат цен! Отправьте два числа через дефис (например: 1000-2000) или \nЕсли цена не важна, напишите: 0"
+        send_msg(vk, user_id, msg)
+        return
+        
+    user_states[user_id]["price_min"] = p_min
+    user_states[user_id]["price_max"] = p_max
+    user_states[user_id]["state"] = "AWAITING_NAME"
+    send_msg(vk, user_id, "Введите название необходимой запчасти (например: Фара)")
+
+
+def handle_name_step(vk, user_id, text):
+    user_states[user_id]["part_name"] = text
+    user_states[user_id]["state"] = "AWAITING_CAR"
+    send_msg(vk, user_id, "Введите марку и модель автомобиля (например: Por).\nЕсли автомобиль не важен, отправьте: 0")
+
+
+def handle_car_step(vk, user_id, text):
+    user_states[user_id]["car_model"] = text
+    user_states[user_id]["state"] = "AWAITING_YEAR"
+    send_msg(vk, user_id, "Введите год выпуска машины или диапазон (например: 2002 или 1996-2001).\nЕсли год не имеет значения, отправьте: 0")
+
+
+def handle_year_step(vk, user_id, text):
+    if not validate_year(text):
+        send_msg(vk, user_id, "Некорректный формат года! Введите четырехзначный год, диапазон через дефис или 0:")
+        return
+        
+    send_msg(vk, user_id, "Запускаю сбор информации с сайта Дром, ожидайте...")
     
-    try:
-        await bot.delete_webhook(drop_pending_updates=True)
-        await dp.start_polling(bot)
-    except Exception as runtime_exception:
-        print(f"Критическая ошибка цикла: {runtime_exception}")
-    finally:
-        await bot.session.close()
+    state_data = user_states[user_id]
+    query_elements = [state_data["part_name"]]
+    
+    if state_data["car_model"] != "0":
+        query_elements.append(state_data["car_model"])
+    if text != "0":
+        query_elements.append(text)
+        
+    final_query = " ".join(query_elements)
+    
+    links = parse_drom_parts(
+        state_data["city"], 
+        final_query, 
+        state_data["price_min"], 
+        state_data["price_max"]
+    )
+    
+    if not links:
+        send_msg(vk, user_id, "По вашему запросу ничего не найдено. Начнем новый поиск?", get_city_keyboard())
+        user_states[user_id]["state"] = "CHOOSING_CITY"
+    else:
+        user_states[user_id]["state"] = "SHOWING_RESULTS"
+        user_states[user_id]["results"] = links
+        user_states[user_id]["current_index"] = 0
+        show_results_page(vk, user_id)
+
+
+def show_results_page(vk, user_id):
+    state_data = user_states[user_id]
+    links = state_data["results"]
+    start = state_data["current_index"]
+    end = start + 10
+    current_chunk = links[start:end]
+    
+    if not current_chunk:
+        send_msg(vk, user_id, "Больше объявлений не найдено.", get_city_keyboard())
+        user_states[user_id]["state"] = "CHOOSING_CITY"
+        return
+
+    msg_text = f"Объявления ({start + 1} - {min(end, len(links))} из {len(links)}):\n\n"
+    msg_text += "\n".join(current_chunk)
+    
+    user_states[user_id]["current_index"] = end
+    
+    if end < len(links):
+        send_msg(vk, user_id, msg_text, get_pagination_keyboard())
+    else:
+        msg_text += "\n\nВывод объявлений завершен."
+        send_msg(vk, user_id, msg_text, get_city_keyboard())
+        user_states[user_id]["state"] = "CHOOSING_CITY"
+
+# ====================================================================
+# ГЛАВНЫЙ ЦИКЛ БОТА
+# ====================================================================
+
+def main():
+    vk_session = vk_api.VkApi(token=TOKEN)
+    vk = vk_session.get_api()
+    
+    print("[Система] Бот успешно запущен и ожидает сообщений...")
+
+    while True:
+        try:
+            longpoll = VkBotLongPoll(vk_session, int(GROUP_ID))
+            
+            for event in longpoll.listen():
+                if event.type != VkBotEventType.MESSAGE_NEW:
+                    continue
+                    
+                msg_obj = event.obj.message
+                user_id = msg_obj["from_id"]
+                text = msg_obj["text"].strip()
+                
+                if not text:
+                    continue
+
+                if user_id not in user_states or text.lower() in ["новый поиск", "start", "привет"]:
+                    init_user_session(user_id)
+                    welcome = "Привет! Давай найдем автозапчасти на Дроме.\nВыберите город из меню или введите его название вручную:"
+                    send_msg(vk, user_id, welcome, get_city_keyboard())
+                    continue
+                    
+                current_state = user_states[user_id]["state"]
+
+                if current_state == "CHOOSING_CITY":
+                    handle_city_step(vk, user_id, text)
+                    
+                elif current_state == "AWAITING_PRICE":
+                    handle_price_step(vk, user_id, text)
+                    
+                elif current_state == "AWAITING_NAME":
+                    handle_name_step(vk, user_id, text)
+                    
+                elif current_state == "AWAITING_CAR":
+                    handle_car_step(vk, user_id, text)
+                    
+                elif current_state == "AWAITING_YEAR":
+                    handle_year_step(vk, user_id, text)
+                    
+                elif current_state == "SHOWING_RESULTS":
+                    if text == "Показать еще 10":
+                        show_results_page(vk, user_id)
+                    else:
+                        send_msg(vk, user_id, "Используйте кнопки меню для управления списком.", get_pagination_keyboard())
+
+        except Exception as error:
+            print(f"[Защита от падения] Ошибка сети VK: {error}. Восстановление через 3 секунды...")
+            time.sleep(3)
+            continue
 
 if __name__ == "__main__":
-    try:
-        asyncio.run(run_application_loop())
-    except KeyboardInterrupt:
-        print("Программа принудительно остановлена пользователем.")
+    main()
